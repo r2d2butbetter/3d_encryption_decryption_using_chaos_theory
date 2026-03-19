@@ -2,13 +2,17 @@
 Demo: 3D model encryption on ModelNet10 OFF files.
 
 Usage:
-    python demo.py                         # encrypts one model per class (test split)
+    python demo.py                               # encrypts one model per class (test split)
     python demo.py --model path/to/file.off
-    python demo.py --all                   # process all test files
+    python demo.py --all --split test            # process all test files
+    python demo.py --all --split train           # process all train files
+    python demo.py --all --split both            # process the entire dataset (train + test)
 
 Outputs are saved to:
-    output/<class>/encrypted_<name>.off
+    output/<class>/encrypted_<name>.off               (single-file or one-per-class)
     output/<class>/decrypted_<name>.off
+    output/<split>/<class>/encrypted_<name>.off       (when using --all)
+    output/<split>/<class>/decrypted_<name>.off
 """
 
 import argparse
@@ -121,15 +125,36 @@ MODELNET10_CLASSES = [
     'monitor', 'night_stand', 'sofa', 'table', 'toilet',
 ]
 
-DATA_ROOT = Path(__file__).parent / 'data' / 'ModelNet10' / 'ModelNet10'
+_DATA_ROOT = None
 OUT_ROOT  = Path(__file__).parent / 'output'
+def _resolve_data_root() -> Path | None:
+    base = Path(__file__).parent / 'data'
+    candidates = [
+        base / 'ModelNet10',                # common layout
+        base / 'ModelNet10' / 'ModelNet10', # nested layout
+    ]
+    for c in candidates:
+        if c.exists():
+            # Heuristic: accept if at least one expected class dir exists
+            if any((c / cls).exists() for cls in MODELNET10_CLASSES):
+                return c
+    return None
 
+def DATA_ROOT() -> Path | None:
+    global _DATA_ROOT
+    if _DATA_ROOT is None:
+        _DATA_ROOT = _resolve_data_root()
+    return _DATA_ROOT
 
 def find_off_files(split: str = 'test'):
     """Return a dict mapping class_name → list of OFF file paths."""
+    root = DATA_ROOT()
+    if root is None:
+        print("Dataset not found under data/ModelNet10. Please check placement.")
+        return {}
     files = {}
     for cls in MODELNET10_CLASSES:
-        cls_dir = DATA_ROOT / cls / split
+        cls_dir = root / cls / split
         off_list = sorted(cls_dir.glob('*.off')) if cls_dir.exists() else []
         if off_list:
             files[cls] = off_list
@@ -151,7 +176,7 @@ def run_one_per_class(key: dict):
     return all_reports
 
 
-def run_all(key: dict, split: str = 'test'):
+def run_all(key: dict, split: str = 'test', print_summary: bool = True):
     """Encrypt/decrypt every file in the given split."""
     all_files = find_off_files(split)
     total = sum(len(v) for v in all_files.values())
@@ -159,7 +184,7 @@ def run_all(key: dict, split: str = 'test'):
     all_reports = []
 
     for cls, file_list in all_files.items():
-        out_dir = OUT_ROOT / cls
+        out_dir = OUT_ROOT / split / cls
         for fpath in file_list:
             done += 1
             print(f"[{done}/{total}] {cls} / {fpath.name}", end='  ', flush=True)
@@ -170,9 +195,22 @@ def run_all(key: dict, split: str = 'test'):
                   f"dec={report['t_dec_ms']:.0f}ms  "
                   f"H_c={report['entropy_cipher']:.4f}  "
                 f"NPCR={report['npcr_diff']:.1f}%")
-
-    _print_summary(all_reports)
+    if print_summary:
+        _print_summary(all_reports)
     return all_reports
+
+
+def run_all_both(key: dict):
+    """Encrypt/decrypt every file across both train and test splits."""
+    combined = []
+    for split in ('train', 'test'):
+        print(f"\nProcessing split: {split}\n" + "-"*40)
+        reports = run_all(key, split=split, print_summary=False)
+        for r in reports:
+            r['split'] = split
+        combined.extend(reports)
+    _print_summary(combined)
+    return combined
 
 
 def _print_summary(reports: list):
@@ -214,10 +252,10 @@ def main():
     parser.add_argument('--model',   type=str, default=None,
                         help='Path to a single .off file to process')
     parser.add_argument('--all',     action='store_true',
-                        help='Process ALL test files (slow)')
+                        help='Process all files for the selected split(s)')
     parser.add_argument('--split',   type=str, default='test',
-                        choices=['train', 'test'],
-                        help='Dataset split to use (default: test)')
+                        choices=['train', 'test', 'both'],
+                        help='Dataset split to use: train, test, or both')
     parser.add_argument('--u1',      type=float, default=DEFAULT_KEY['u1'])
     parser.add_argument('--s1',      type=float, default=DEFAULT_KEY['s1'])
     parser.add_argument('--beta',    type=float, default=DEFAULT_KEY['beta'])
@@ -230,7 +268,10 @@ def main():
         out_dir  = OUT_ROOT / off_path.parent.name
         process_file(off_path, out_dir, key)
     elif args.all:
-        run_all(key, split=args.split)
+        if args.split == 'both':
+            run_all_both(key)
+        else:
+            run_all(key, split=args.split)
     else:
         print("Running one model per class (test split) …\n")
         run_one_per_class(key)
