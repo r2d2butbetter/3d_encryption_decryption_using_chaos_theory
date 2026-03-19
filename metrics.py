@@ -9,6 +9,14 @@ Computes:
 """
 
 import numpy as np
+from typing import Tuple, Optional
+
+try:
+    # Optional dependency: SciPy for exact Hungarian matching
+    from scipy.optimize import linear_sum_assignment  # type: ignore
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +200,194 @@ def security_report(plain_coords: np.ndarray,
 def print_report(report: dict):
     """Pretty-print the security report."""
     print("=" * 55)
+
+
+# ---------------------------------------------------------------------------
+# Earth Mover's Distance (EMD) / 1-Wasserstein on point clouds
+# ---------------------------------------------------------------------------
+
+def _normalize_points(points: np.ndarray, mode: str = 'bbox') -> np.ndarray:
+    """
+    Normalize a point cloud for scale/translation invariance.
+
+    modes:
+      - 'bbox': translate to bbox-center and scale so max side length == 1
+      - 'none': no normalization
+    """
+    P = np.asarray(points, dtype=np.float64)
+    if mode == 'none':
+        return P
+    mins = P.min(axis=0)
+    maxs = P.max(axis=0)
+    center = (mins + maxs) / 2.0
+    scale = float(np.max(maxs - mins))
+    if scale <= 0:
+        scale = 1.0
+    return (P - center) / scale
+
+
+def _downsample_equal(P: np.ndarray, Q: np.ndarray, max_points: int,
+                      seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+    """Downsample both sets to the same size n = min(len(P), len(Q), max_points)."""
+    n = int(min(len(P), len(Q), max_points))
+    if n <= 0:
+        return P[:0], Q[:0]
+    rng = np.random.default_rng(seed)
+    idxP = rng.choice(len(P), size=n, replace=False) if len(P) > n else np.arange(len(P))
+    idxQ = rng.choice(len(Q), size=n, replace=False) if len(Q) > n else np.arange(len(Q))
+    # If one side had fewer points than n (shouldn't happen due to min), adjust
+    n = min(len(idxP), len(idxQ))
+    return P[idxP[:n]], Q[idxQ[:n]]
+
+
+def emd_point_cloud(P: np.ndarray,
+                    Q: np.ndarray,
+                    normalize: str = 'bbox',
+                    max_points: int = 1024,
+                    seed: int = 0,
+                    exact_if_scipy: bool = True) -> float:
+    """
+    Compute Earth Mover's Distance (1-Wasserstein with L2 ground metric)
+    between two 3D point clouds with uniform weights.
+
+    - If SciPy is available and `exact_if_scipy` is True, uses the Hungarian
+      algorithm for an exact minimum-cost matching (O(n^3)).
+    - Otherwise uses a greedy nearest-neighbor matching (approximation).
+
+    Parameters
+    ----------
+    P, Q        : np.ndarray of shape (N, 3) and (M, 3)
+    normalize   : 'bbox' or 'none' – preprocessing to make distances comparable
+    max_points  : cap number of points (for performance). Downsamples uniformly.
+    seed        : RNG seed for reproducible downsampling
+    exact_if_scipy : use SciPy Hungarian if available
+
+    Returns
+    -------
+    emd : float – average transport cost (lower is more similar)
+    """
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    if P.ndim != 2 or Q.ndim != 2 or P.shape[1] != 3 or Q.shape[1] != 3:
+        raise ValueError("P and Q must be (N,3) and (M,3) arrays")
+
+    # Normalize
+    Pn = _normalize_points(P, mode=normalize)
+    Qn = _normalize_points(Q, mode=normalize)
+
+    # Downsample equally
+    Pn, Qn = _downsample_equal(Pn, Qn, max_points=max_points, seed=seed)
+    n = len(Pn)
+    if n == 0:
+        return 0.0
+
+    # Cost matrix (Euclidean distances)
+    # For performance, compute squared distances in blocks if needed; here n<=max_points
+    # so a dense compute is fine.
+    diff = Pn[:, None, :] - Qn[None, :, :]
+    C = np.sqrt(np.sum(diff * diff, axis=2))  # shape (n, n)
+
+    if exact_if_scipy and _HAVE_SCIPY:
+        row_ind, col_ind = linear_sum_assignment(C)
+        emd = float(C[row_ind, col_ind].mean())
+        return emd
+
+    # Greedy fallback: iteratively match nearest unmatched pairs
+    emd_sum = 0.0
+    used = np.zeros(n, dtype=bool)
+    for i in range(n):
+        # nearest Q for P[i] among unused
+        dists = C[i].copy()
+        dists[used] = np.inf
+        j = int(np.argmin(dists))
+        used[j] = True
+        emd_sum += float(dists[j])
+    return emd_sum / n
+
+
+def sinkhorn_emd_point_cloud(P: np.ndarray,
+                             Q: np.ndarray,
+                             normalize: str = 'bbox',
+                             max_points: int = 1024,
+                             seed: int = 0,
+                             epsilon: float = 0.05,
+                             max_iter: int = 200,
+                             tol: float = 1e-3) -> float:
+    """
+    Compute entropically-regularized OT (Sinkhorn distance) between two
+    point clouds with uniform weights using the Sinkhorn-Knopp algorithm.
+
+    Returns the transport cost sum(P * C) where C is the pairwise Euclidean
+    distance matrix. With bbox normalization, distances are scale-invariant.
+
+    Parameters
+    ----------
+    P, Q       : (N,3), (M,3) point clouds
+    normalize  : 'bbox' or 'none'
+    max_points : cap on points per cloud (uniform downsampling)
+    seed       : RNG seed for downsampling
+    epsilon    : entropic regularization strength (>0). Smaller -> closer to EMD, but harder numerically.
+    max_iter   : maximum Sinkhorn iterations
+    tol        : stopping tolerance on marginal errors (L1 per row/col)
+    """
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    if P.ndim != 2 or Q.ndim != 2 or P.shape[1] != 3 or Q.shape[1] != 3:
+        raise ValueError("P and Q must be (N,3) and (M,3) arrays")
+
+    # Normalize and downsample equally
+    Pn = _normalize_points(P, mode=normalize)
+    Qn = _normalize_points(Q, mode=normalize)
+    Pn, Qn = _downsample_equal(Pn, Qn, max_points=max_points, seed=seed)
+    n = len(Pn)
+    if n == 0:
+        return 0.0
+
+    # Cost matrix (Euclidean distances)
+    diff = Pn[:, None, :] - Qn[None, :, :]
+    C = np.sqrt(np.sum(diff * diff, axis=2))  # (n, n)
+
+    # Uniform marginals (sum to 1)
+    a = np.full(n, 1.0 / n)
+    b = np.full(n, 1.0 / n)
+
+    # Gibbs kernel K = exp(-C/epsilon)
+    # Clip exponent for numerical stability
+    E = -C / max(epsilon, 1e-6)
+    E = np.clip(E, -60.0, 60.0)
+    K = np.exp(E) + 1e-12
+
+    # Sinkhorn iterations: u <- a / (K v), v <- b / (K^T u)
+    u = np.ones(n)
+    v = np.ones(n)
+    for _ in range(max_iter):
+        Kv = K @ v
+        # Avoid divide by zero
+        Kv = np.maximum(Kv, 1e-12)
+        u_new = a / Kv
+
+        KTu = K.T @ u_new
+        KTu = np.maximum(KTu, 1e-12)
+        v_new = b / KTu
+
+        # Check marginal errors occasionally
+        if _ % 10 == 0:
+            # Current transport plan rowsums and colsums
+            # rowsums = u_new * (K @ v_new)
+            rowsums = u_new * (K @ v_new)
+            colsums = v_new * (K.T @ u_new)
+            err = float(np.mean(np.abs(rowsums - a)) + np.mean(np.abs(colsums - b)))
+            if err < tol:
+                u, v = u_new, v_new
+                break
+        u, v = u_new, v_new
+
+    # Transport plan P = diag(u) K diag(v)
+    # Compute cost = sum(P * C)
+    # To avoid forming full P explicitly (n<=max_points so it's fine), but compute efficiently
+    P_plan = (u[:, None] * K) * v[None, :]
+    cost = float(np.sum(P_plan * C))
+    return cost
     print("          SECURITY ANALYSIS REPORT")
     print("=" * 55)
 

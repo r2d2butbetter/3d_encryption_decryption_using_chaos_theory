@@ -15,6 +15,7 @@ An implementation of a chaos-theory-based encryption/decryption pipeline for 3D 
 - [off_io.py](off_io.py): Minimal OFF reader/writer utilities.
 - [metrics.py](metrics.py): Security metrics (entropy, correlation, NPCR/UACI, differential attack NPCR/UACI) and report printer.
 - [demo.py](demo.py): CLI demo that runs the full pipeline on ModelNet10 or a single OFF file.
+- [emd_eval.py](emd_eval.py): Compute Earth Mover's Distance (EMD) between outputs and originals.
 - data/ModelNet10/ModelNet10: Expected dataset root (see Setup).
 - output/: Encrypted/decrypted outputs and per-file keys (JSON).
 
@@ -22,10 +23,11 @@ An implementation of a chaos-theory-based encryption/decryption pipeline for 3D 
 - Python 3.8+
 - NumPy
 
-Install NumPy (if needed):
+Install NumPy (if needed). Optionally install SciPy for exact EMD (faster and more precise than the greedy fallback):
 
 ```bash
 pip install numpy
+pip install scipy  # optional, for exact Hungarian matching in EMD
 ```
 
 ## Dataset Setup (ModelNet10)
@@ -84,6 +86,27 @@ The demo computes and prints a report with:
 - Reconstruction error (max/mean) between plaintext and decrypted vertices.
 
 Metrics are implemented in [metrics.py](metrics.py) and printed by [demo.py](demo.py).
+
+### Earth Mover's Distance (EMD)
+Evaluate geometric similarity between the original meshes and the results (encrypted/decrypted) using EMD on point clouds (vertex sets). By default, both point clouds are bbox-normalized and uniformly downsampled to at most 1024 points per set for performance. The default method uses the Sinkhorn (entropic-regularized) approximation.
+
+Run across all available outputs:
+
+```powershell
+python emd_eval.py                  # encrypted+decrypted vs originals (Sinkhorn)
+python emd_eval.py --subset decrypted
+python emd_eval.py --subset encrypted
+```
+
+Common options:
+
+- `--class <name>`: restrict to a single class (e.g., `chair`).
+- `--max-points 2048`: increase matching size (slower, more accurate).
+- `--no-normalize`: disable bbox normalization (use raw coordinates).
+- `--method sinkhorn|hungarian|greedy`: choose algorithm (default: sinkhorn). `hungarian` requires SciPy and computes exact matching; `greedy` is a fast approximation.
+- `--epsilon 0.05 --max-iter 200 --tol 1e-3`: Sinkhorn controls (smaller `epsilon` → closer to true EMD, potentially slower/less stable).
+
+Results are printed per file and saved to `emd_results.csv`. If SciPy is installed, exact Hungarian matching is used; otherwise a greedy nearest-neighbor approximation is applied.
 
 ## Reproducibility & Keys
 - The full key dictionary returned by encryption is saved as JSON per file. It contains both user-specified seeds (`u1`, `s1`, `beta`, `L`, `T`) and plaintext-derived parameters. Keep this file to enable decryption.
