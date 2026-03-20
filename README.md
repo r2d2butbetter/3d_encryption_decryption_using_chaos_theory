@@ -1,4 +1,4 @@
-# Chaos-Based 3D Model Encryption (ModelNet10 OFF)
+# Chaos-Based 3D Model Encryption (OFF Datasets)
 
 An implementation of a chaos-theory-based encryption/decryption pipeline for 3D models in OFF format, adapted from the paper “A novel 3-D image encryption algorithm based on SHA-256 and chaos theory” (Singh et al., Alexandria Engineering Journal, 2025). This repo demonstrates encrypting and decrypting ModelNet10 meshes and evaluates security metrics commonly used in the literature.
 
@@ -14,9 +14,9 @@ An implementation of a chaos-theory-based encryption/decryption pipeline for 3D 
 - [chaos_encrypt.py](chaos_encrypt.py): Core encryption/decryption (logistic, LDCML, tent maps; SHA-256 parameter derivation).
 - [off_io.py](off_io.py): Minimal OFF reader/writer utilities.
 - [metrics.py](metrics.py): Security metrics (entropy, correlation, NPCR/UACI, differential attack NPCR/UACI) and report printer.
-- [demo.py](demo.py): CLI demo that runs the full pipeline on ModelNet10 or a single OFF file.
+- [demo.py](demo.py): CLI demo that runs the full pipeline on ModelNet10/ModelNet40/ScanObjectNN or a single OFF file.
 - [emd_eval.py](emd_eval.py): Compute Earth Mover's Distance (EMD) between outputs and originals.
-- data/ModelNet10/ModelNet10: Expected dataset root (see Setup).
+- data/ModelNet10, data/ModelNet40, data/ScanObjectNN: Dataset roots (or pass `--data-root`).
 - output/: Encrypted/decrypted outputs and per-file keys (JSON).
 
 ## Requirements
@@ -30,8 +30,52 @@ pip install numpy
 pip install scipy  # optional, for exact Hungarian matching in EMD
 ```
 
-## Dataset Setup (ModelNet10)
-This project expects the ModelNet10 dataset in OFF format at:
+## Dataset Setup (ModelNet10 / ModelNet40 / ScanObjectNN)
+The pipeline now supports these dataset presets:
+
+- `modelnet10`
+- `modelnet40`
+- `scanobjectnn`
+
+By default, the scripts search these common roots:
+
+- `data/ModelNet10` or `data/ModelNet10/ModelNet10`
+- `data/ModelNet40` or `data/ModelNet40/ModelNet40`
+- `data/ScanObjectNN` (and common case variants)
+
+You can always override discovery with:
+
+```bash
+--data-root /path/to/dataset
+```
+
+If the selected dataset is not found locally, scripts now auto-download supported datasets:
+
+- `modelnet40` from:
+  - `http://modelnet.cs.princeton.edu/ModelNet40.zip`
+  - `https://modelnet.cs.princeton.edu/ModelNet40.zip`
+- `scanobjectnn` from:
+  - `https://hkust-vgd.ust.hk/scanobjectnn/h5_files.zip`
+
+Disable this behavior with:
+
+```bash
+--no-download
+```
+
+ScanObjectNN note: the official package is `h5_files.zip`. The bootstrap now automatically converts `.h5` point clouds into OFF files under:
+
+- `data/ScanObjectNN/OFF/class_<id>/{train,test,all}/*.off`
+
+This OFF layout is directly consumed by `demo.py` and `emd_eval.py`.
+
+The dataset should contain OFF files in one of these layouts:
+
+- `<root>/<class>/<split>/*.off`
+- `<root>/<split>/<class>/*.off`
+- `<root>/<class>/*.off`
+
+For ModelNet-style datasets, the usual structure remains:
 
 ```
 data/ModelNet10/ModelNet10/<class>/{train,test}/*.off
@@ -40,10 +84,18 @@ data/ModelNet10/ModelNet10/<class>/{train,test}/*.off
 Place or symlink the dataset so each class directory (e.g., `bathtub`, `chair`, …) contains `train/` and `test/` folders with `.off` files. If you do not have the dataset, download the OFF version of ModelNet10 from the official source and arrange it in the structure above.
 
 ## Quick Start
-Run the demo (process one example per class in the test split):
+Run the demo (process one example per class):
 
 ```powershell
 python demo.py
+```
+
+Use a specific dataset preset:
+
+```powershell
+python demo.py --dataset modelnet40
+python demo.py --dataset scanobjectnn --split all --all
+python demo.py --dataset modelnet40 --no-download
 ```
 
 Process a single OFF file:
@@ -55,7 +107,9 @@ python demo.py --model "path\to\file.off"
 Process all files in a split (slow):
 
 ```powershell
-python demo.py --all --split test
+python demo.py --all --dataset modelnet10 --split test
+python demo.py --all --dataset modelnet40 --split both
+python demo.py --all --dataset scanobjectnn --split all
 ```
 
 Change key seeds (optional):
@@ -68,6 +122,8 @@ Outputs are written to `output/<class>/`:
 - `encrypted_<name>.off`: Encrypted mesh (may have extra vertices).
 - `decrypted_<name>.off`: Decrypted mesh (should match original geometry).
 - `key_<name>.json`: Full decryption key and metadata (includes plaintext-derived parameters and structural info like padding count and coordinate shift).
+
+For batch runs, outputs are namespaced under `output/<dataset>/<split>/<class>/`.
 
 ## How It Works (Brief)
 - SHA-256 of the plaintext vertex matrix derives chaotic parameters (`n1..n3`, `alpha`, `alpha0`, `delta`) and the integer mask `bitxor_1` based on coordinate magnitudes.
@@ -84,8 +140,18 @@ The demo computes and prints a report with:
 - Adjacent-vertex correlation along x/y/z.
 - Differential-attack NPCR/UACI (paper-style): compare ciphertexts from two plaintexts that differ by a tiny perturbation.
 - Reconstruction error (max/mean) between plaintext and decrypted vertices.
+- EMD (Sinkhorn approximation) for encrypted vs original and decrypted vs original.
 
 Metrics are implemented in [metrics.py](metrics.py) and printed by [demo.py](demo.py).
+Each run also writes a JSON metrics artifact by default:
+
+- `output/metrics_<dataset>_<split>_<timestamp>.json`
+
+Or set a custom path:
+
+```powershell
+python demo.py --all --dataset modelnet40 --split test --metrics-json output/modelnet40_test_metrics.json
+```
 
 ### Earth Mover's Distance (EMD)
 Evaluate geometric similarity between the original meshes and the results (encrypted/decrypted) using EMD on point clouds (vertex sets). By default, both point clouds are bbox-normalized and uniformly downsampled to at most 1024 points per set for performance. The default method uses the Sinkhorn (entropic-regularized) approximation.
@@ -106,7 +172,17 @@ Common options:
 - `--method sinkhorn|hungarian|greedy`: choose algorithm (default: sinkhorn). `hungarian` requires SciPy and computes exact matching; `greedy` is a fast approximation.
 - `--epsilon 0.05 --max-iter 200 --tol 1e-3`: Sinkhorn controls (smaller `epsilon` → closer to true EMD, potentially slower/less stable).
 
-Results are printed per file and saved to `emd_results.csv`. If SciPy is installed, exact Hungarian matching is used; otherwise a greedy nearest-neighbor approximation is applied.
+Results are printed per file and saved to `emd_results.csv` and `emd_results.json`.
+
+You can run EMD on other datasets as well:
+
+```powershell
+python emd_eval.py --dataset modelnet40 --subset both
+python emd_eval.py --dataset scanobjectnn --subset decrypted --method sinkhorn
+python emd_eval.py --dataset modelnet40 --subset both --no-download
+```
+
+If SciPy is installed, exact Hungarian matching is used; otherwise a greedy nearest-neighbor approximation is applied.
 
 ## Reproducibility & Keys
 - The full key dictionary returned by encryption is saved as JSON per file. It contains both user-specified seeds (`u1`, `s1`, `beta`, `L`, `T`) and plaintext-derived parameters. Keep this file to enable decryption.
