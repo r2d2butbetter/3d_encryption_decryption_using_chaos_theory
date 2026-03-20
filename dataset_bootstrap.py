@@ -88,24 +88,60 @@ def _guess_split_from_filename(name: str) -> str:
 
 
 def _load_h5_data_labels(h5f):
-    data_key = None
-    for key in ('data', 'points', 'xyz'):
-        if key in h5f:
-            data_key = key
-            break
-    if data_key is None:
-        raise ValueError(f"No point dataset key found. Available keys: {list(h5f.keys())}")
+    # Some ScanObjectNN files store datasets in nested groups and/or use
+    # non-standard names. Discover candidates recursively, then choose points
+    # and labels based on tensor shape compatibility.
+    dataset_items = []
 
-    label_key = None
-    for key in ('label', 'labels', 'target'):
-        if key in h5f:
-            label_key = key
-            break
-    if label_key is None:
-        raise ValueError(f"No label dataset key found. Available keys: {list(h5f.keys())}")
+    def _collector(name, obj):
+        if hasattr(obj, 'shape'):
+            dataset_items.append((name, tuple(obj.shape)))
 
-    data = np.asarray(h5f[data_key])
-    labels = np.asarray(h5f[label_key]).reshape(-1)
+    h5f.visititems(_collector)
+    if not dataset_items:
+        raise ValueError("No datasets found in h5 file")
+
+    point_candidates = []
+    label_candidates = []
+    for name, shape in dataset_items:
+        if len(shape) == 3 and shape[-1] >= 3 and shape[0] > 0:
+            point_candidates.append((name, shape))
+        if len(shape) in (1, 2) and shape[0] > 0:
+            label_candidates.append((name, shape))
+
+    # Prefer common names when multiple candidates exist.
+    def _name_priority(n: str) -> int:
+        low = n.lower()
+        if 'data' in low or 'point' in low or 'xyz' in low:
+            return 0
+        return 1
+
+    point_candidates.sort(key=lambda x: (_name_priority(x[0]), x[0]))
+    label_candidates.sort(key=lambda x: (_name_priority(x[0]), x[0]))
+
+    if not point_candidates:
+        raise ValueError(f"No point dataset found. Discovered datasets: {dataset_items}")
+
+    # Match labels to points by sample dimension.
+    point_name, point_shape = point_candidates[0]
+    n_samples = point_shape[0]
+
+    label_name = None
+    for cand_name, cand_shape in label_candidates:
+        # 1D labels: (N,), 2D labels: (N,1) or (N,k)
+        if cand_shape[0] == n_samples:
+            label_name = cand_name
+            break
+
+    if label_name is None:
+        raise ValueError(
+            f"No compatible label dataset for points '{point_name}' shape={point_shape}. "
+            f"Discovered datasets: {dataset_items}"
+        )
+
+    data = np.asarray(h5f[point_name])
+    labels = np.asarray(h5f[label_name]).reshape(-1)
+
     if data.ndim != 3 or data.shape[-1] < 3:
         raise ValueError(f"Unexpected point tensor shape: {data.shape}")
     if len(labels) != data.shape[0]:
@@ -128,11 +164,18 @@ def _convert_scanobjectnn_h5_to_off(scan_root: Path) -> Path:
     off_root = scan_root / 'OFF'
     converted = 0
 
+    skipped = 0
+
     for h5_path in h5_files:
         split = _guess_split_from_filename(h5_path.name)
         print(f"Converting ScanObjectNN file: {h5_path.name} (split={split})")
-        with h5py.File(h5_path, 'r') as h5f:
-            points, labels = _load_h5_data_labels(h5f)
+        try:
+            with h5py.File(h5_path, 'r') as h5f:
+                points, labels = _load_h5_data_labels(h5f)
+        except Exception as exc:
+            skipped += 1
+            print(f"Skipping unsupported/empty h5 file {h5_path.name}: {exc}")
+            continue
 
         for idx in range(points.shape[0]):
             cls_id = int(labels[idx])
@@ -146,7 +189,7 @@ def _convert_scanobjectnn_h5_to_off(scan_root: Path) -> Path:
     if converted == 0 and not _contains_off_files(off_root):
         raise RuntimeError("ScanObjectNN conversion produced no OFF files")
 
-    print(f"ScanObjectNN OFF conversion complete. New files: {converted}")
+    print(f"ScanObjectNN OFF conversion complete. New files: {converted}, skipped h5 files: {skipped}")
     return off_root
 
 
